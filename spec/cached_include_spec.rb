@@ -3,106 +3,163 @@ require 'liquid'
 require 'pry'
 require_relative "../lib/liquid_caching"
 
-class Example
+class UncacheableObject
   def to_liquid
-    ExampleDrop.new
+    UncacheableObjectDrop.new
   end
 end
 
-class ExampleDrop < ::Liquid::Drop
+class UncacheableObjectDrop < ::Liquid::Drop
   extend LiquidCaching::UncacheableDrop
 
   def bar
-    # puts caller
-    # "BAR!!!"
     "UNCACHEABLE_VALUE"
   end
 end
 
 RSpec.describe "cached include" do
   let(:fs) { double(:file_system) }
-  let(:context) { Liquid::Context.new({"foo" => Example.new}) }
+  let(:context) { Liquid::Context.new({"foo" => UncacheableObject.new}) }
 
   before do
     context.registers[:file_system] = fs
+    # Liquid does some introspection for backwards-compatability
     allow(fs).to receive(:method).with(:read_template_file) { double(:method, arity: 1) }
   end
 
-  it "works" do
-    template = Liquid::Template.parse(<<~EOF)
-      {% include 'aaa' %}
-      {% include 'bbb' %}
-    EOF
+  context "single level template" do
+    let(:template) do
+      Liquid::Template.parse(<<~EOF)
+        {% include 'aaa' %}
+        {% include 'bbb' %}
+      EOF
+    end
 
-    expect(fs).to receive(:read_template_file).with('aaa') { "{{ foo.bar }}" }
-    expect(fs).to receive(:read_template_file).with('bbb') { "hello" }
+    before do
+      allow(fs).to receive(:read_template_file).with('aaa') { "{{ foo.bar }}" }
+      allow(fs).to receive(:read_template_file).with('bbb') { "hello" }
+    end
 
-    context.registers["precompile"] = true
-    precompiled_template = template.render!(context)
+    it "renders normally when caching is not enabled" do
+      result = template.render!(context)
 
-    expect(precompiled_template).to eq <<~EOF
-      {% include 'aaa' %}
-      hello
-    EOF
+      expect(result).to eq <<~EOF
+        UNCACHEABLE_VALUE
+        hello
+      EOF
+    end
 
-    template = Liquid::Template.parse(precompiled_template)
-    context.registers["precompile"] = false
-    result = template.render!(context)
+    it "renders a cacheable template where uncacheable includes are left unrendered" do
+      context.registers[:caching] = true
+      cacheable_template = template.render!(context)
 
-    expect(result).to eq <<~EOF
-      UNCACHEABLE_VALUE
-      hello
-    EOF
+      expect(cacheable_template).to eq <<~EOF
+        {% include 'aaa' %}
+        hello
+      EOF
+    end
 
-    # puts context.registers["precompile_result"]
+    it "provides templates that were uncacheable for later use" do
+      context.registers[:caching] = true
+      cacheable_template = template.render!(context)
+
+      expect(context.registers[:cached_file_system].rendered_results).to eq({
+        "aaa" => "UNCACHEABLE_VALUE"
+      })
+    end
   end
 
-  it "nesting" do
-    template = Liquid::Template.parse(<<~EOF)
-      {% include 'aaa' %}
-    EOF
+  context "nested template" do
+    # |- aaa
+    #    |- bbb
+    #       |- ccc  <- uncacheable method called
+    # |- zzz
+    let(:template) do
+      Liquid::Template.parse(<<~EOF)
+        {% include 'aaa' %}
+        {% include 'zzz' %}
+      EOF
+    end
 
-    expect(fs).to receive(:read_template_file).with('aaa') { <<~EOF }
-      {% include 'bbb' %}
-      {% include 'ccc' %}
-    EOF
-    expect(fs).to receive(:read_template_file).with('bbb') { "{{ foo.bar }}" }
-    expect(fs).to receive(:read_template_file).with('ccc') { "hello" }
+    before do
+      allow(fs).to receive(:read_template_file).with('aaa') { <<~EOF }
+        aaa start
+        {% include 'bbb' %}
+        aaa end
+      EOF
+      allow(fs).to receive(:read_template_file).with('bbb') { <<~EOF }
+        bbb start
+        {% include 'ccc' %}
+        bbb end
+      EOF
+      allow(fs).to receive(:read_template_file).with('ccc') { <<~EOF }
+        ccc start
+        {{ foo.bar }}
+        ccc end
+      EOF
+      allow(fs).to receive(:read_template_file).with('zzz') { "zzz" }
+    end
 
-    context.registers["precompile"] = true
-    precompiled_template = template.render!(context)
+    it "renders normally when caching is not enabled" do
+      result = template.render!(context)
 
-    expect(precompiled_template).to eq <<~EOF
-      {% include 'bbb' %}
-      hello
-    EOF
+      expect(result).to eq <<~EOF
+        aaa start
+        bbb start
+        ccc start
+        UNCACHEABLE_VALUE
+        ccc end
 
-    template = Liquid::Template.parse(precompiled_template)
-    context.registers["precompile"] = false
-    result = template.render!(context)
+        bbb end
 
-    expect(result).to eq <<~EOF
-      UNCACHEABLE_VALUE
-      hello
-    EOF
+        aaa end
 
-    puts context.registers["precompile_result"]
+        zzz
+      EOF
+    end
+
+    it "renders a cacheable template where uncacheable includes are left unrendered" do
+      context.registers[:caching] = true
+      cacheable_template = template.render!(context)
+
+      expect(cacheable_template).to eq <<~EOF
+        {% include 'aaa' %}
+        zzz
+      EOF
+    end
+
+    it "provides templates that were uncacheable for later use" do
+      context.registers[:caching] = true
+      cacheable_template = template.render!(context)
+
+      expect(context.registers[:cached_file_system].rendered_results).to eq({
+        "aaa" => "aaa start\n{% include 'bbb' %}\naaa end\n",
+        "bbb" => "bbb start\n{% include 'ccc' %}\nbbb end\n",
+        "ccc" => "ccc start\nUNCACHEABLE_VALUE\nccc end\n",
+      })
+    end
+
+    it "reduces the expense of a second render by storing a reusable file_system containing rendered results" do
+      context.registers[:caching] = true
+      cacheable_template = template.render!(context)
+
+      new_context = Liquid::Context.new
+      new_context.registers[:file_system] = context.registers[:cached_file_system]
+      result = Liquid::Template.parse(cacheable_template).render!(new_context)
+
+      expect(result).to eq <<~EOF
+        aaa start
+        bbb start
+        ccc start
+        UNCACHEABLE_VALUE
+        ccc end
+
+        bbb end
+
+        aaa end
+
+        zzz
+      EOF
+    end
   end
-
-  # it "nesting" do
-  #   template = Liquid::Template.parse(<<-EOF)
-  #     {% include 'aaa' %}
-  #     {% include 'safe' %}
-  #   EOF
-  #
-  #   expect(fs).to receive(:read_template_file).with('aaa') { "{% include 'unsafe' %}" }
-  #   expect(fs).to receive(:read_template_file).with('unsafe') { "{{ foo }}\n{% include 'safe' %}" }
-  #
-  #   expect(fs).to receive(:read_template_file).with('safe') { "hello" }
-  #
-  #   result = template.render!(context)
-  #
-  #   puts "-----------"
-  #   p result
-  # end
 end
