@@ -41,7 +41,7 @@ module LiquidCaching
   class CachedInclude < ::Liquid::Include
     def render(context)
       # TODO: account for variables passed to `include` in key (`@attributes` I believe)
-      template_key = @template_name[1..-2] # unquote
+      template_key = context.evaluate(@template_name_expr)
 
       if context.registers[:caching]
         stack = context.registers[:template_stack] ||= TemplateStack.new
